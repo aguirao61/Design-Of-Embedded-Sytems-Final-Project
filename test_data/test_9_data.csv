@@ -1,0 +1,38 @@
+SECTION,METRIC,VALUE,UNIT,PLAIN_ENGLISH_MEANING
+SUMMARY,weights_load_time,21.09,ms,Time spent reading yolov3-tiny.weights from disk into memory.
+SUMMARY,preprocess_time,97.01,ms,Time spent resizing the image to 416x416 and normalizing pixel values to 0..1.
+SUMMARY,inference_time,1529.75,ms,Time spent running all neural network layers in NumPy (excluding image loading/drawing).
+SUMMARY,postprocess_save_time,82.93,ms,"Time spent filtering overlapping boxes (NMS), drawing boxes, and saving result.jpg."
+SUMMARY,total_script_time,1739.80,ms,End-to-end runtime of the entire Python script from start to finish.
+SUMMARY,weights_size_fp32,33.79,MB,Size of all model weights/biases stored as 32-bit floats (FP32).
+SUMMARY,total_stored_activations_fp32,31.27,MB,Combined size of all saved layer outputs kept in our list during the forward pass (FP32).
+SUMMARY,python_peak_heap,83.16,MB,Peak memory allocated inside Python's tracked heap during execution.
+SUMMARY,process_ram_current,0.00,MB,Current physical RAM (Working Set / RSS) used by the Python process at the end.
+SUMMARY,process_ram_peak,0.00,MB,Highest physical RAM used by the Python process at any point during the run.
+SUMMARY,detections_count,39,boxes,Number of final objects kept after confidence filtering and Non-Maximum Suppression.
+
+LAYER_INDEX,LAYER_TYPE,OUTPUT_SHAPE,TIME_MS,LAYER_WEIGHT_FLOATS,OUTPUT_BUFFER_KB_FP32,NOTES
+0,convolutional,"(1, 16, 416, 416)",488.591,496,10816.00,"conv 3x3, stride=1, bn_folded, act=leaky"
+1,maxpool,"(1, 16, 208, 208)",30.830,0,2704.00,"maxpool 2x2, stride=2"
+2,convolutional,"(1, 32, 208, 208)",231.095,4736,5408.00,"conv 3x3, stride=1, bn_folded, act=leaky"
+3,maxpool,"(1, 32, 104, 104)",15.657,0,1352.00,"maxpool 2x2, stride=2"
+4,convolutional,"(1, 64, 104, 104)",171.618,18688,2704.00,"conv 3x3, stride=1, bn_folded, act=leaky"
+5,maxpool,"(1, 64, 52, 52)",6.589,0,676.00,"maxpool 2x2, stride=2"
+6,convolutional,"(1, 128, 52, 52)",130.526,74240,1352.00,"conv 3x3, stride=1, bn_folded, act=leaky"
+7,maxpool,"(1, 128, 26, 26)",5.109,0,338.00,"maxpool 2x2, stride=2"
+8,convolutional,"(1, 256, 26, 26)",70.944,295936,676.00,"conv 3x3, stride=1, bn_folded, act=leaky"
+9,maxpool,"(1, 256, 13, 13)",1.877,0,169.00,"maxpool 2x2, stride=2"
+10,convolutional,"(1, 512, 13, 13)",31.700,1181696,338.00,"conv 3x3, stride=1, bn_folded, act=leaky"
+11,maxpool,"(1, 512, 13, 13)",1.815,0,338.00,"maxpool 2x2, stride=1"
+12,convolutional,"(1, 1024, 13, 13)",82.908,4722688,676.00,"conv 3x3, stride=1, bn_folded, act=leaky"
+13,convolutional,"(1, 256, 13, 13)",6.785,263168,169.00,"conv 1x1, stride=1, bn_folded, act=leaky"
+14,convolutional,"(1, 512, 13, 13)",32.187,1181696,338.00,"conv 3x3, stride=1, bn_folded, act=leaky"
+15,convolutional,"(1, 255, 13, 13)",4.590,130815,168.34,"conv 1x1, stride=1, no_bn, act=linear"
+16,yolo,"(1, 255, 13, 13)",2.893,0,168.34,"decode anchors [3, 4, 5], classes=80"
+17,route,"(1, 256, 13, 13)",0.223,0,169.00,concat layers [-4]
+18,convolutional,"(1, 128, 13, 13)",1.519,33280,84.50,"conv 1x1, stride=1, bn_folded, act=leaky"
+19,upsample,"(1, 128, 26, 26)",0.645,0,338.00,upsample 2x
+20,route,"(1, 384, 26, 26)",0.932,0,1014.00,"concat layers [-1, 8]"
+21,convolutional,"(1, 256, 26, 26)",47.789,885760,676.00,"conv 3x3, stride=1, bn_folded, act=leaky"
+22,convolutional,"(1, 255, 26, 26)",3.071,65535,673.36,"conv 1x1, stride=1, no_bn, act=linear"
+23,yolo,"(1, 255, 26, 26)",7.453,0,673.36,"decode anchors [0, 1, 2], classes=80"

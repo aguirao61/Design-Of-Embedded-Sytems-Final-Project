@@ -1,0 +1,295 @@
+from pathlib import Path
+import numpy as np
+from PIL import Image, ImageDraw
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+CFG_FILE = ROOT_DIR / "yolov3-tiny.cfg"
+WEIGHTS_FILE = ROOT_DIR / "yolov3-tiny.weights"
+NAMES_FILE = ROOT_DIR / "coco.names"
+OUT_IMAGE = ROOT_DIR / "result.jpg"
+ANCHORS = [(10, 14), (23, 27), (37, 58), (81, 82), (135, 169), (344, 319)]
+
+
+def find_test_image(root: Path) -> Path:
+    candidates = [
+        "test_image.webp",
+        "test_image.webpg",
+        "test_image.jpg",
+        "test_image.jpeg",
+        "test_image.png",
+    ]
+    for name in candidates:
+        p = root / name
+        if p.exists():
+            return p
+    raise FileNotFoundError(
+        f"Could not find test_image.* in {root}. Check the exact filename in VS Code."
+    )
+
+
+def parse_cfg(cfg_path: Path):
+    blocks = []
+    current = None
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                if current is not None:
+                    blocks.append(current)
+                current = {"type": line[1:-1].strip()}
+            elif "=" in line and current is not None:
+                k, v = [x.strip() for x in line.split("=", 1)]
+                current[k] = v
+    if current is not None:
+        blocks.append(current)
+    return blocks
+
+
+def load_weights(weights_path: Path):
+    with open(weights_path, "rb") as f:
+        header = np.fromfile(f, dtype=np.int32, count=3)
+        _seen = np.fromfile(f, dtype=np.int64, count=1)
+        data = np.fromfile(f, dtype=np.float32)
+    return header, data
+
+
+def leaky_relu(x: np.ndarray) -> np.ndarray:
+    return np.where(x >= 0, x, 0.1 * x)
+
+
+def sigmoid(x: np.ndarray) -> np.ndarray:
+    x = np.clip(x, -50.0, 50.0)
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def conv2d_same(x: np.ndarray, kernel: np.ndarray, bias: np.ndarray, stride: int = 1) -> np.ndarray:
+    _, c_in, h, w = x.shape
+    c_out, _, k, _ = kernel.shape
+    pad_total = max(k - stride, 0)
+    pad_top = pad_total // 2
+    pad_bottom = pad_total - pad_top
+    pad_left = pad_total // 2
+    pad_right = pad_total - pad_left
+
+    x_pad = np.pad(
+        x[0],
+        ((0, 0), (pad_top, pad_bottom), (pad_left, pad_right)),
+        mode="constant",
+        constant_values=0.0,
+    )
+
+    out_h = (h + pad_top + pad_bottom - k) // stride + 1
+    out_w = (w + pad_left + pad_right - k) // stride + 1
+    out = np.zeros((c_out, out_h, out_w), dtype=np.float32)
+
+    for ky in range(k):
+        for kx in range(k):
+            patch = x_pad[:, ky : ky + out_h * stride : stride, kx : kx + out_w * stride : stride]
+            w_tap = kernel[:, :, ky, kx]
+            out += np.tensordot(w_tap, patch, axes=([1], [0]))
+
+    out += bias[:, None, None]
+    return out[None, ...]
+
+
+def maxpool2d_darknet(x: np.ndarray, size: int, stride: int) -> np.ndarray:
+    _, c, h, w = x.shape
+    if stride == 1 and size == 2:
+        x_pad = np.pad(x[0], ((0, 0), (0, 1), (0, 1)), mode="edge")
+        out_h, out_w = h, w
+    else:
+        pad_h = max(size - stride, 0) // 2
+        pad_w = max(size - stride, 0) // 2
+        x_pad = np.pad(
+            x[0],
+            ((0, 0), (pad_h, pad_h), (pad_w, pad_w)),
+            mode="constant",
+            constant_values=-np.inf,
+        )
+        out_h = (x_pad.shape[1] - size) // stride + 1
+        out_w = (x_pad.shape[2] - size) // stride + 1
+
+    out = np.full((c, out_h, out_w), -np.inf, dtype=np.float32)
+    for ky in range(size):
+        for kx in range(size):
+            window = x_pad[:, ky : ky + out_h * stride : stride, kx : kx + out_w * stride : stride]
+            out = np.maximum(out, window)
+    return out[None, ...]
+
+
+def upsample2x(x: np.ndarray, stride: int = 2) -> np.ndarray:
+    return np.repeat(np.repeat(x, stride, axis=2), stride, axis=3)
+
+
+def decode_yolo_layer(feat: np.ndarray, mask, num_classes: int, img_w: int, img_h: int, net_w: int, net_h: int):
+    _, _, gh, gw = feat.shape
+    n_a = len(mask)
+    pred = feat.reshape(n_a, 5 + num_classes, gh, gw).transpose(0, 2, 3, 1)
+
+    grid_x, grid_y = np.meshgrid(np.arange(gw), np.arange(gh))
+    bx = (sigmoid(pred[..., 0]) + grid_x[None, ...]) / gw
+    by = (sigmoid(pred[..., 1]) + grid_y[None, ...]) / gh
+
+    layer_anchors = np.array([ANCHORS[i] for i in mask], dtype=np.float32)[:, None, None, :]
+    bw = (np.exp(np.clip(pred[..., 2], -20, 20)) * layer_anchors[..., 0]) / net_w
+    bh = (np.exp(np.clip(pred[..., 3], -20, 20)) * layer_anchors[..., 1]) / net_h
+
+    obj_conf = sigmoid(pred[..., 4])
+    cls_conf = sigmoid(pred[..., 5:])
+    scores = obj_conf[..., None] * cls_conf
+
+    boxes, confs, cids = [], [], []
+    a_idx, y_idx, x_idx, c_idx = np.where(scores > 0.07)
+    for a, gy, gx, c in zip(a_idx, y_idx, x_idx, c_idx):
+        score = float(scores[a, gy, gx, c])
+        cx = bx[a, gy, gx] * img_w
+        cy = by[a, gy, gx] * img_h
+        w = bw[a, gy, gx] * img_w
+        h = bh[a, gy, gx] * img_h
+        x0 = max(0.0, cx - w / 2.0)
+        y0 = max(0.0, cy - h / 2.0)
+        x1 = min(float(img_w), cx + w / 2.0)
+        y1 = min(float(img_h), cy + h / 2.0)
+        boxes.append([x0, y0, x1, y1])
+        confs.append(score)
+        cids.append(int(c))
+
+    return boxes, confs, cids
+
+
+def iou(b1, b2) -> float:
+    xx0 = max(b1[0], b2[0])
+    yy0 = max(b1[1], b2[1])
+    xx1 = min(b1[2], b2[2])
+    yy1 = min(b1[3], b2[3])
+    inter = max(0.0, xx1 - xx0) * max(0.0, yy1 - yy0)
+    a1 = max(0.0, b1[2] - b1[0]) * max(0.0, b1[3] - b1[1])
+    a2 = max(0.0, b2[2] - b2[0]) * max(0.0, b2[3] - b2[1])
+    union = a1 + a2 - inter
+    return inter / union if union > 0 else 0.0
+
+
+def nms(boxes, confs, cids, thresh=0.4):
+    order = np.argsort(confs)[::-1]
+    keep = []
+    while len(order) > 0:
+        i = order[0]
+        keep.append(i)
+        rem = [
+            j for j in order[1:] if not (cids[j] == cids[i] and iou(boxes[i], boxes[j]) > thresh)
+        ]
+        order = np.array(rem, dtype=int)
+    return keep
+
+
+def main():
+    for path in (CFG_FILE, WEIGHTS_FILE, NAMES_FILE):
+        if not path.exists():
+            raise FileNotFoundError(f"Missing required file: {path}")
+
+    img_path = find_test_image(ROOT_DIR)
+    blocks = parse_cfg(CFG_FILE)
+    header, weight_data = load_weights(WEIGHTS_FILE)
+
+    with open(NAMES_FILE, "r", encoding="utf-8") as f:
+        labels = [line.strip() for line in f if line.strip()]
+
+    net_block = blocks[0]
+    net_w = int(net_block.get("width", 416))
+    net_h = int(net_block.get("height", 416))
+
+    pil_img = Image.open(img_path).convert("RGB")
+    img_w, img_h = pil_img.size
+    resized = pil_img.resize((net_w, net_h), Image.Resampling.BILINEAR)
+    x = np.asarray(resized, dtype=np.float32).transpose(2, 0, 1)[None, ...] / 255.0
+
+    outputs = []
+    detections_boxes, detections_confs, detections_cids = [], [], []
+    ptr = 0
+    prev_channels = 3
+
+    for idx, b in enumerate(blocks[1:]):
+        btype = b["type"]
+        if btype == "convolutional":
+            batch_norm = int(b.get("batch_normalize", 0))
+            filters = int(b["filters"])
+            ksize = int(b["size"])
+            stride = int(b["stride"])
+            activation = b.get("activation", "linear")
+
+            if batch_norm:
+                bn_biases = weight_data[ptr : ptr + filters]; ptr += filters
+                bn_scales = weight_data[ptr : ptr + filters]; ptr += filters
+                bn_mean = weight_data[ptr : ptr + filters]; ptr += filters
+                bn_var = weight_data[ptr : ptr + filters]; ptr += filters
+                conv_weights = weight_data[ptr : ptr + filters * prev_channels * ksize * ksize]; ptr += filters * prev_channels * ksize * ksize
+                kernel = conv_weights.reshape(filters, prev_channels, ksize, ksize)
+
+                std = np.sqrt(bn_var + 1e-6)
+                folded_kernel = kernel * (bn_scales / std)[:, None, None, None]
+                folded_bias = bn_biases - bn_scales * bn_mean / std
+            else:
+                biases = weight_data[ptr : ptr + filters]; ptr += filters
+                conv_weights = weight_data[ptr : ptr + filters * prev_channels * ksize * ksize]; ptr += filters * prev_channels * ksize * ksize
+                kernel = conv_weights.reshape(filters, prev_channels, ksize, ksize)
+                folded_kernel = kernel
+                folded_bias = biases
+
+            x = conv2d_same(x, folded_kernel, folded_bias, stride=stride)
+            if activation == "leaky":
+                x = leaky_relu(x)
+            prev_channels = filters
+
+        elif btype == "maxpool":
+            size = int(b["size"])
+            stride = int(b["stride"])
+            x = maxpool2d_darknet(x, size=size, stride=stride)
+
+        elif btype == "upsample":
+            stride = int(b.get("stride", 2))
+            x = upsample2x(x, stride=stride)
+
+        elif btype == "route":
+            layers = [int(i.strip()) for i in b["layers"].split(",")]
+            chunks = [outputs[l_idx] for l_idx in layers]
+            x = np.concatenate(chunks, axis=1)
+            prev_channels = x.shape[1]
+
+        elif btype == "shortcut":
+            from_idx = int(b["from"])
+            x = x + outputs[from_idx]
+
+        elif btype == "yolo":
+            mask = [int(i.strip()) for i in b["mask"].split(",")]
+            num_classes = int(b["classes"])
+            boxes, confs, cids = decode_yolo_layer(x, mask, num_classes, img_w, img_h, net_w, net_h)
+            detections_boxes.extend(boxes)
+            detections_confs.extend(confs)
+            detections_cids.extend(cids)
+
+        outputs.append(x)
+        print(f"Layer {idx:2d} [{btype:13s}] -> shape={x.shape}")
+
+    keep = nms(detections_boxes, detections_confs, detections_cids, thresh=0.4)
+    draw = ImageDraw.Draw(pil_img)
+
+    if not keep:
+        print("No objects detected above 0.5 confidence.")
+    else:
+        for i in keep:
+            x0, y0, x1, y1 = detections_boxes[i]
+            cid = detections_cids[i]
+            conf = detections_confs[i]
+            name = labels[cid] if cid < len(labels) else f"class_{cid}"
+            print(f"Found {name} ({conf:.2f}) at [{int(x0)}, {int(y0)}, {int(x1)}, {int(y1)}]")
+            draw.rectangle([x0, y0, x1, y1], outline=(0, 255, 0), width=3)
+            draw.text((x0 + 4, max(0.0, y0 - 14)), f"{name} {conf:.2f}", fill=(0, 255, 0))
+
+    pil_img.save(OUT_IMAGE)
+    print(f"Saved output to {OUT_IMAGE}")
+
+
+if __name__ == "__main__":
+    main()
