@@ -1,0 +1,305 @@
+from pathlib import Path
+import numpy as np
+from PIL import Image, ImageDraw
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+CFG_FILE = ROOT_DIR / "yolov3-tiny.cfg"
+WEIGHTS_FILE = ROOT_DIR / "yolov3-tiny.weights"
+NAMES_FILE = ROOT_DIR / "coco.names"
+QUANT_DIR = ROOT_DIR / "quantized_int8"
+OUT_COMPARE = ROOT_DIR / "compare_fp32_vs_int8.jpg"
+ANCHORS = [(10, 14), (23, 27), (37, 58), (81, 82), (135, 169), (344, 319)]
+
+
+def find_test_image(root: Path) -> Path:
+    for name in [
+        "test_image.webp",
+        "test_image.webpg",
+        "test_image.jpg",
+        "test_image.jpeg",
+        "test_image.png",
+    ]:
+        p = root / name
+        if p.exists():
+            return p
+    raise FileNotFoundError(f"No test image found in {root}")
+
+
+def parse_cfg(cfg_path: Path):
+    blocks = []
+    current = None
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                if current is not None:
+                    blocks.append(current)
+                current = {"type": line[1:-1].strip()}
+            elif "=" in line and current is not None:
+                k, v = [x.strip() for x in line.split("=", 1)]
+                current[k] = v
+    if current is not None:
+        blocks.append(current)
+    return blocks
+
+
+def load_raw_weights(weights_path: Path) -> np.ndarray:
+    with open(weights_path, "rb") as f:
+        _header = np.fromfile(f, dtype=np.int32, count=3)
+        _seen = np.fromfile(f, dtype=np.int64, count=1)
+        return np.fromfile(f, dtype=np.float32)
+
+
+def leaky_relu(x: np.ndarray) -> np.ndarray:
+    return np.where(x >= 0, x, 0.1 * x)
+
+
+def sigmoid(x: np.ndarray) -> np.ndarray:
+    x = np.clip(x, -50.0, 50.0)
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def conv2d_same(x: np.ndarray, kernel: np.ndarray, bias: np.ndarray, stride: int = 1) -> np.ndarray:
+    _, _, h, w = x.shape
+    c_out, _, k, _ = kernel.shape
+    pad_total = max(k - stride, 0)
+    pad_top = pad_total // 2
+    pad_bottom = pad_total - pad_top
+    pad_left = pad_total // 2
+    pad_right = pad_total - pad_left
+
+    x_pad = np.pad(
+        x[0],
+        ((0, 0), (pad_top, pad_bottom), (pad_left, pad_right)),
+        mode="constant",
+        constant_values=0.0,
+    )
+    out_h = (h + pad_top + pad_bottom - k) // stride + 1
+    out_w = (w + pad_left + pad_right - k) // stride + 1
+    out = np.zeros((c_out, out_h, out_w), dtype=np.float32)
+
+    for ky in range(k):
+        for kx in range(k):
+            patch = x_pad[:, ky : ky + out_h * stride : stride, kx : kx + out_w * stride : stride]
+            out += np.tensordot(kernel[:, :, ky, kx], patch, axes=([1], [0]))
+
+    out += bias[:, None, None]
+    return out[None, ...]
+
+
+def maxpool2d_darknet(x: np.ndarray, size: int, stride: int) -> np.ndarray:
+    _, c, h, w = x.shape
+    if stride == 1 and size == 2:
+        x_pad = np.pad(x[0], ((0, 0), (0, 1), (0, 1)), mode="edge")
+        out_h, out_w = h, w
+    else:
+        pad_h = max(size - stride, 0) // 2
+        pad_w = max(size - stride, 0) // 2
+        x_pad = np.pad(
+            x[0],
+            ((0, 0), (pad_h, pad_h), (pad_w, pad_w)),
+            mode="constant",
+            constant_values=-np.inf,
+        )
+        out_h = (x_pad.shape[1] - size) // stride + 1
+        out_w = (x_pad.shape[2] - size) // stride + 1
+
+    out = np.full((c, out_h, out_w), -np.inf, dtype=np.float32)
+    for ky in range(size):
+        for kx in range(size):
+            window = x_pad[:, ky : ky + out_h * stride : stride, kx : kx + out_w * stride : stride]
+            out = np.maximum(out, window)
+    return out[None, ...]
+
+
+def upsample2x(x: np.ndarray, stride: int = 2) -> np.ndarray:
+    return np.repeat(np.repeat(x, stride, axis=2), stride, axis=3)
+
+
+def decode_yolo_layer(feat: np.ndarray, mask, num_classes: int, img_w: int, img_h: int, net_w: int, net_h: int):
+    _, _, gh, gw = feat.shape
+    n_a = len(mask)
+    pred = feat.reshape(n_a, 5 + num_classes, gh, gw).transpose(0, 2, 3, 1)
+
+    grid_x, grid_y = np.meshgrid(np.arange(gw), np.arange(gh))
+    bx = (sigmoid(pred[..., 0]) + grid_x[None, ...]) / gw
+    by = (sigmoid(pred[..., 1]) + grid_y[None, ...]) / gh
+
+    layer_anchors = np.array([ANCHORS[i] for i in mask], dtype=np.float32)[:, None, None, :]
+    bw = (np.exp(np.clip(pred[..., 2], -20, 20)) * layer_anchors[..., 0]) / net_w
+    bh = (np.exp(np.clip(pred[..., 3], -20, 20)) * layer_anchors[..., 1]) / net_h
+
+    scores = sigmoid(pred[..., 4])[..., None] * sigmoid(pred[..., 5:])
+    boxes, confs, cids = [], [], []
+    a_idx, y_idx, x_idx, c_idx = np.where(scores > 0.10)
+    for a, gy, gx, c in zip(a_idx, y_idx, x_idx, c_idx):
+        cx, cy = bx[a, gy, gx] * img_w, by[a, gy, gx] * img_h
+        w, h = bw[a, gy, gx] * img_w, bh[a, gy, gx] * img_h
+        boxes.append([
+            max(0.0, cx - w / 2.0),
+            max(0.0, cy - h / 2.0),
+            min(float(img_w), cx + w / 2.0),
+            min(float(img_h), cy + h / 2.0),
+        ])
+        confs.append(float(scores[a, gy, gx, c]))
+        cids.append(int(c))
+    return boxes, confs, cids
+
+
+def iou(b1, b2) -> float:
+    xx0, yy0 = max(b1[0], b2[0]), max(b1[1], b2[1])
+    xx1, yy1 = min(b1[2], b2[2]), min(b1[3], b2[3])
+    inter = max(0.0, xx1 - xx0) * max(0.0, yy1 - yy0)
+    a1 = max(0.0, b1[2] - b1[0]) * max(0.0, b1[3] - b1[1])
+    a2 = max(0.0, b2[2] - b2[0]) * max(0.0, b2[3] - b2[1])
+    union = a1 + a2 - inter
+    return inter / union if union > 0 else 0.0
+
+
+def nms(boxes, confs, cids, thresh=0.4):
+    order = np.argsort(confs)[::-1]
+    keep = []
+    while len(order) > 0:
+        i = order[0]
+        keep.append(i)
+        rem = [j for j in order[1:] if not (cids[j] == cids[i] and iou(boxes[i], boxes[j]) > thresh)]
+        order = np.array(rem, dtype=int)
+    return keep
+
+
+def run_pass(blocks, raw_weights, x_init, img_w, img_h, net_w, net_h, load_from_quant_dir: bool):
+    outputs = []
+    boxes, confs, cids = [], [], []
+    ptr = 0
+    prev_channels = 3
+    conv_count = 0
+    weight_diffs = []
+    x = x_init.copy()
+
+    for idx, b in enumerate(blocks[1:]):
+        btype = b["type"]
+        if btype == "convolutional":
+            bn = int(b.get("batch_normalize", 0))
+            filters = int(b["filters"])
+            ksize = int(b["size"])
+            stride = int(b["stride"])
+            act = b.get("activation", "linear")
+            w_count = filters * prev_channels * ksize * ksize
+
+            if bn:
+                bn_b = raw_weights[ptr : ptr + filters]; ptr += filters
+                bn_s = raw_weights[ptr : ptr + filters]; ptr += filters
+                bn_m = raw_weights[ptr : ptr + filters]; ptr += filters
+                bn_v = raw_weights[ptr : ptr + filters]; ptr += filters
+                cw = raw_weights[ptr : ptr + w_count]; ptr += w_count
+                std = np.sqrt(bn_v + 1e-6)
+                fp32_k = (cw.reshape(filters, prev_channels, ksize, ksize) * (bn_s / std)[:, None, None, None]).astype(np.float32)
+                fp32_bias = (bn_b - bn_s * bn_m / std).astype(np.float32)
+            else:
+                bias_raw = raw_weights[ptr : ptr + filters]; ptr += filters
+                cw = raw_weights[ptr : ptr + w_count]; ptr += w_count
+                fp32_k = cw.reshape(filters, prev_channels, ksize, ksize).astype(np.float32)
+                fp32_bias = bias_raw.astype(np.float32)
+
+            if load_from_quant_dir:
+                prefix = f"layer_{idx:02d}_conv_{conv_count:02d}"
+                q_k = np.load(QUANT_DIR / f"{prefix}_w_int8.npy")
+                scales = np.load(QUANT_DIR / f"{prefix}_scales_fp32.npy")
+                saved_bias = np.load(QUANT_DIR / f"{prefix}_bias_fp32.npy")
+                active_k = (q_k.astype(np.float32) * scales[:, None, None, None]).astype(np.float32)
+                active_bias = saved_bias
+                weight_diffs.append(float(np.max(np.abs(fp32_k - active_k))))
+            else:
+                active_k = fp32_k
+                active_bias = fp32_bias
+
+            x = conv2d_same(x, active_k, active_bias, stride=stride)
+            if act == "leaky":
+                x = leaky_relu(x)
+            prev_channels = filters
+            conv_count += 1
+
+        elif btype == "maxpool":
+            x = maxpool2d_darknet(x, size=int(b["size"]), stride=int(b["stride"]))
+        elif btype == "upsample":
+            x = upsample2x(x, stride=int(b.get("stride", 2)))
+        elif btype == "route":
+            layers = [int(i.strip()) for i in b["layers"].split(",")]
+            x = np.concatenate([outputs[i] for i in layers], axis=1)
+            prev_channels = x.shape[1]
+        elif btype == "shortcut":
+            x = x + outputs[int(b["from"])]
+        elif btype == "yolo":
+            mask = [int(i.strip()) for i in b["mask"].split(",")]
+            b_out, c_out, id_out = decode_yolo_layer(x, mask, int(b["classes"]), img_w, img_h, net_w, net_h)
+            boxes.extend(b_out)
+            confs.extend(c_out)
+            cids.extend(id_out)
+
+        outputs.append(x)
+
+    keep = nms(boxes, confs, cids, thresh=0.4)
+    results = []
+    for i in keep:
+        results.append((cids[i], float(confs[i]), [round(v, 1) for v in boxes[i]]))
+    return results, weight_diffs
+
+
+def main():
+    if not QUANT_DIR.exists():
+        raise FileNotFoundError(f"Run convert_weights.py first so {QUANT_DIR} exists.")
+
+    img_path = find_test_image(ROOT_DIR)
+    blocks = parse_cfg(CFG_FILE)
+    raw_weights = load_raw_weights(WEIGHTS_FILE)
+    labels = [line.strip() for line in NAMES_FILE.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+    net_w = int(blocks[0].get("width", 416))
+    net_h = int(blocks[0].get("height", 416))
+
+    pil_img = Image.open(img_path).convert("RGB")
+    img_w, img_h = pil_img.size
+    resized = pil_img.resize((net_w, net_h), Image.Resampling.BILINEAR)
+    x_init = np.asarray(resized, dtype=np.float32).transpose(2, 0, 1)[None, ...] / 255.0
+
+    fp32_dets, _ = run_pass(blocks, raw_weights, x_init, img_w, img_h, net_w, net_h, load_from_quant_dir=False)
+    int8_dets, w_diffs = run_pass(blocks, raw_weights, x_init, img_w, img_h, net_w, net_h, load_from_quant_dir=True)
+
+    def label_name(cid: int) -> str:
+        return labels[cid] if cid < len(labels) else f"class_{cid}"
+
+    print(f"FP32 detections ({len(fp32_dets)}):")
+    for cid, conf, box in fp32_dets:
+        print(f"  - {label_name(cid):10s} conf={conf:.3f} box={box}")
+
+    print(f"\nINT8-loaded detections ({len(int8_dets)}):")
+    for cid, conf, box in int8_dets:
+        print(f"  - {label_name(cid):10s} conf={conf:.3f} box={box}")
+
+    if w_diffs:
+        print(f"\nMax per-layer weight rounding error: {max(w_diffs):.5f} (mean: {np.mean(w_diffs):.5f})")
+
+    # Side-by-side visual check: FP32 on left (green), INT8-loaded on right (cyan)
+    left = pil_img.copy()
+    d_left = ImageDraw.Draw(left)
+    for cid, conf, (x0, y0, x1, y1) in fp32_dets:
+        d_left.rectangle([x0, y0, x1, y1], outline=(0, 255, 0), width=3)
+        d_left.text((x0 + 4, max(0.0, y0 - 14)), f"{label_name(cid)} {conf:.2f}", fill=(0, 255, 0))
+
+    right = pil_img.copy()
+    d_right = ImageDraw.Draw(right)
+    for cid, conf, (x0, y0, x1, y1) in int8_dets:
+        d_right.rectangle([x0, y0, x1, y1], outline=(0, 255, 255), width=3)
+        d_right.text((x0 + 4, max(0.0, y0 - 14)), f"{label_name(cid)} {conf:.2f}", fill=(0, 255, 255))
+
+    side_by_side = Image.new("RGB", (img_w * 2, img_h))
+    side_by_side.paste(left, (0, 0))
+    side_by_side.paste(right, (img_w, 0))
+    side_by_side.save(OUT_COMPARE)
+    print(f"\nSaved side-by-side comparison to {OUT_COMPARE}")
+
+
+if __name__ == "__main__":
+    main()

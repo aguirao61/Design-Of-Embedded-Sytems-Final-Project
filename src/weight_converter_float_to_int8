@@ -1,0 +1,135 @@
+from pathlib import Path
+import numpy as np
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+CFG_FILE = ROOT_DIR / "yolov3-tiny.cfg"
+WEIGHTS_FILE = ROOT_DIR / "yolov3-tiny.weights"
+OUT_DIR = ROOT_DIR / "quantized_int8"
+
+
+def parse_cfg(cfg_path: Path) -> list[dict[str, str]]:
+    blocks: list[dict[str, str]] = []
+    current: dict[str, str] | None = None
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                if current is not None:
+                    blocks.append(current)
+                current = {"type": line[1:-1].strip()}
+            elif "=" in line and current is not None:
+                k, v = [x.strip() for x in line.split("=", 1)]
+                current[k] = v
+    if current is not None:
+        blocks.append(current)
+    return blocks
+
+
+def load_weights(weights_path: Path) -> np.ndarray:
+    with open(weights_path, "rb") as f:
+        _header = np.fromfile(f, dtype=np.int32, count=3)
+        _seen = np.fromfile(f, dtype=np.int64, count=1)
+        data = np.fromfile(f, dtype=np.float32)
+    return data
+
+
+def quantize_per_channel_int8(kernel: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    c_out = kernel.shape[0]
+    flat = kernel.reshape(c_out, -1)
+    max_abs = np.max(np.abs(flat), axis=1)
+    scales = np.maximum(max_abs / 127.0, 1e-8).astype(np.float32)
+    q_flat = np.clip(np.round(flat / scales[:, None]), -127, 127).astype(np.int8)
+    return q_flat.reshape(kernel.shape), scales
+
+
+def save_hex(hex_path: Path, arr: np.ndarray) -> None:
+    raw_bytes = arr.astype(np.int8).view(np.uint8).ravel()
+    with open(hex_path, "w", encoding="utf-8") as f:
+        for b in raw_bytes:
+            f.write(f"{b:02x}\n")
+
+
+def main() -> None:
+    if not CFG_FILE.exists():
+        raise FileNotFoundError(f"Missing {CFG_FILE}")
+    if not WEIGHTS_FILE.exists():
+        raise FileNotFoundError(f"Missing {WEIGHTS_FILE}")
+
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    blocks = parse_cfg(CFG_FILE)
+    weight_data = load_weights(WEIGHTS_FILE)
+
+    ptr = 0
+    prev_channels = 3
+    conv_count = 0
+
+    for idx, b in enumerate(blocks[1:]):
+        btype = b["type"]
+        if btype == "convolutional":
+            batch_norm = int(b.get("batch_normalize", 0))
+            filters = int(b["filters"])
+            ksize = int(b["size"])
+            w_count = filters * prev_channels * ksize * ksize
+
+            if batch_norm:
+                bn_biases = weight_data[ptr : ptr + filters]; ptr += filters
+                bn_scales = weight_data[ptr : ptr + filters]; ptr += filters
+                bn_mean = weight_data[ptr : ptr + filters]; ptr += filters
+                bn_var = weight_data[ptr : ptr + filters]; ptr += filters
+                conv_w = weight_data[ptr : ptr + w_count]; ptr += w_count
+
+                kernel = conv_w.reshape(filters, prev_channels, ksize, ksize)
+                std = np.sqrt(bn_var + 1e-6)
+                folded_kernel = (kernel * (bn_scales / std)[:, None, None, None]).astype(np.float32)
+                folded_bias = (bn_biases - bn_scales * bn_mean / std).astype(np.float32)
+            else:
+                biases = weight_data[ptr : ptr + filters]; ptr += filters
+                conv_w = weight_data[ptr : ptr + w_count]; ptr += w_count
+
+                kernel = conv_w.reshape(filters, prev_channels, ksize, ksize)
+                folded_kernel = kernel.astype(np.float32)
+                folded_bias = biases.astype(np.float32)
+
+            q_kernel, scales = quantize_per_channel_int8(folded_kernel)
+
+            prefix = f"layer_{idx:02d}_conv_{conv_count:02d}"
+            np.save(OUT_DIR / f"{prefix}_w_int8.npy", q_kernel)
+            np.save(OUT_DIR / f"{prefix}_scales_fp32.npy", scales)
+            np.save(OUT_DIR / f"{prefix}_bias_fp32.npy", folded_bias)
+            save_hex(OUT_DIR / f"{prefix}_w_int8.hex", q_kernel)
+
+            print(f"{prefix}: shape={q_kernel.shape}, int8_bytes={q_kernel.nbytes}")
+            prev_channels = filters
+            conv_count += 1
+
+        elif btype == "route":
+            layers = [int(i.strip()) for i in b["layers"].split(",")]
+            # Track channel count for subsequent conv layers without running activations
+            ch_sum = 0
+            for l_idx in layers:
+                # Walk back through prior blocks to get output channels of l_idx
+                target_idx = (idx + l_idx) if l_idx < 0 else l_idx
+                ch_sum += get_block_channels(blocks[1:], target_idx)
+            prev_channels = ch_sum
+
+
+def get_block_channels(layer_blocks: list[dict[str, str]], target_idx: int) -> int:
+    ch = 3
+    block_ch: list[int] = []
+    for i, b in enumerate(layer_blocks):
+        t = b["type"]
+        if t == "convolutional":
+            ch = int(b["filters"])
+        elif t == "route":
+            layers = [int(x.strip()) for x in b["layers"].split(",")]
+            ch = sum(block_ch[(i + l) if l < 0 else l] for l in layers)
+        block_ch.append(ch)
+        if i == target_idx:
+            return ch
+    raise IndexError(f"Layer index {target_idx} out of range")
+
+
+if __name__ == "__main__":
+    main()
